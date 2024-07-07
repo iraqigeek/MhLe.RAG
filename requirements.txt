@@ -1,0 +1,12 @@
+tiktoken==0.7.0
+tree_sitter-0.21.1
+scipy-1.14.0
+faiss-cpu-1.8.0.post1
+numpy-1.26.4
+networkx-3.3
+flask-3.0.3
+flask_cors-4.0.1
+flask_socketio-5.3.6
+argparse-1.4.0
+scikit-learn-1.5.1
+tqdm-4.66.4
