@@ -11,6 +11,8 @@ import logging
 import networkx as nx
 import numpy as np
 import requests
+import asyncio
+import httpx
 from scipy.spatial.distance import cosine
 from tree_sitter import Parser, Language
 
@@ -19,20 +21,23 @@ from tree_sitter import Parser, Language
 # maybe there's a totally big brain way of looking at this in which case pls lmk!
 from grammar_utils.ast_traversers import (
     TreeNode, traverse_tree_js, traverse_tree_go, traverse_tree_go, traverse_tree_java,
-    traverse_tree_kt, traverse_tree_python, traverse_tree_swift, traverse_tree_cpp,traverse_tree_c,
+    traverse_tree_kt, traverse_tree_python, traverse_tree_cpp,traverse_tree_c,
 )
 
 # Ollama backend-- update accordingly.
 EMBEDDING_API_URL = "http://localhost:11434/api/embeddings"
 LLM_API_URL = "http://localhost:11434/api/generate"
-CODEBASE_DB_PATH = "./assets/codebase_embeddings.db"
-REQUIREMENTS_DB_PATH = "./assets/requirements_embeddings.db"
-CODE_EMBEDDING_MODEL = "unclemusclez/jina-embeddings-v2-base-code:q4" #768dim
-REQUIREMENT_EMBEDDING_MODEL = "unclemusclez/jina-embeddings-v2-base-code:q4" #768dim
+CODEBASE_DB_PATH = "rag_assets/codebase_embeddings.db"
+REQUIREMENTS_DB_PATH = "rag_assets/requirements_embeddings.db"
+CODE_EMBEDDING_MODEL = "mxbai-embed-large:latest" #768dim
+REQUIREMENT_EMBEDDING_MODEL = "mxbai-embed-large:latest" #768dim
 logging.basicConfig(level=logging.DEBUG)
 
 # see: ./grammar_utils/so, what is this .so file?.md
-LANGUAGE_SO_PATH = "./grammar_utils/language_grammars.so"
+if sys.platform == "win32":
+    LANGUAGE_SO_PATH = "./grammar_utils/languages.dll"
+else:
+    LANGUAGE_SO_PATH = "./grammar_utils/language_grammars.so"
 LANGUAGE_DATA = {
     "java": ("java", [".java"]),
     "kotlin": ("kotlin", [".kt"]),
@@ -41,7 +46,15 @@ LANGUAGE_DATA = {
     "python": ("python", [".py"]),
     "cpp": ("cpp", [".cpp", ".cc", ".cxx"]),
     "c": ("c", [".c"]),
-    "swift": ("swift", [".swift"])}
+    "markdown": ("markdown", [".md"]),
+    #"swift": ("swift", [".swift"])
+    }
+
+def has_extension(file_path, extensions):
+    for ext in extensions:
+        if file_path.endswith(ext):
+            return True
+    return False
 
 # I've yet to research on the feasibility of differents encoders being a better fit in this project (over gpt-4)
 enc = tiktoken.encoding_for_model("gpt-4")
@@ -57,7 +70,7 @@ def init_tree_sitter_languages():
     global extension_to_language
     extension_to_language = {
         lang: (create_language(data[0]), data[1])
-        for lang, data in LANGUAGE_DATA.items()
+        for lang, data in LANGUAGE_DATA.items() if lang != 'markdown'
     }
 
 ########################################################################################################################
@@ -184,42 +197,55 @@ def process_code_string(code_string, language, file_path):
         traverse_tree_cpp(root_node, bytes(code_string, "utf8"), node_tree, language)
     elif language.name == "c":
         traverse_tree_c(root_node, bytes(code_string, "utf8"), node_tree, language)
-    elif language.name == "swift":
-        traverse_tree_swift(root_node, bytes(code_string, "utf8"), node_tree, language)
+    # elif language.name == "swift":
+    #     traverse_tree_swift(root_node, bytes(code_string, "utf8"), node_tree, language)
     else:
         raise ValueError(f"Unsupported language: {language.name}")
 
     return node_tree
 
-def init_tree_sitter(root_dir):
+async def init_tree_sitter(root_dir):
     modules = {}
     file_trees = {}
     file_sizes = {}
     package_names = {}
-    directories = [os.path.join(root_dir, d) for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d)) and not should_skip_path(os.path.join(root_dir, d))]
+    #file_extensions = [x for xs in [value for key, value in list(LANGUAGE_DATA.values())] for x in xs]
+    all_directories = os.listdir(root_dir)
+    all_directories.append(root_dir)
+    directories = [os.path.join(root_dir, d) 
+                   for d in all_directories
+                   if (os.path.isdir(os.path.join(root_dir, d)) 
+                        and not should_skip_path(os.path.join(root_dir, d)) 
+                       #or (os.path.isfile(d) and has_extension(d, file_extensions))
+                       )]
     total_directories = len(directories)
     processed_directories = 0
     readme_info_list = []
     global embeddings_db
     embeddings_db = {}
 
-    for dir_name in directories:
+    tasks = []
+    for dir_name in root_dir:
         repo_path = os.path.join(root_dir, dir_name)
         if os.path.isdir(repo_path):
             module_dir = dir_name
             processed_directories += 1
             logging.info(f"Processing {dir_name}: {(processed_directories / total_directories) * 100:.2f}% complete")
-            process_repository(repo_path, modules, file_trees, file_sizes, package_names, readme_info_list)
+            task = asyncio.create_task(process_repository(repo_path, modules, file_trees, file_sizes, package_names, readme_info_list))
+            tasks.append(task)
 
-    save_file_trees(file_trees)
-    save_embeddings_db(embeddings_db)
 
-    json_data = process_full_graph("./assets/file_trees.json")
+    #await asyncio.sleep(10)
+    await asyncio.gather(*tasks)
+    save_file_trees(root_dir, file_trees)
+    save_embeddings_db(root_dir, embeddings_db)
 
-    with open("./assets/full_graph.json", "w") as outfile:
+    json_data = process_full_graph("./rag_assets/file_trees.json")
+
+    with open("./rag_assets/full_graph.json", "w") as outfile:
         json.dump(json_data, outfile, indent=4, sort_keys=True)
 
-    with open("./assets/repos_readme.json", 'w', encoding='utf-8') as file:
+    with open("./rag_assets/repos_readme.json", 'w', encoding='utf-8') as file:
         json.dump(readme_info_list, file, ensure_ascii=False, indent=4)
 
     generate_individual_user_jsons(json_data)
@@ -228,7 +254,7 @@ def init_tree_sitter(root_dir):
     return modules, file_sizes, package_names, file_trees, json_data
 
 def load_file_trees():
-    file_path = "./assets/file_trees.json"
+    file_path = "./rag_assets/file_trees.json"
     if os.path.exists(file_path):
         with open(file_path, "r") as file:
             return json.load(file)
@@ -236,13 +262,18 @@ def load_file_trees():
 
 def should_skip_path(path):
     skip_directories = [
-        'node_modules', 'build', 'dist', 'out', 'bin', '.git', '.svn', '.vscode',
+        '.venv','node_modules', 'build', 'dist', 'out', 'bin', '.git', '.svn', '.vscode',
         '__pycache__', '.idea', 'obj', 'lib', 'vendor', 'target', '.next', 'pkg',
-        'venv', '.tox', 'wheels', 'Debug', 'Release', 'deps'
+        'venv', '.tox', 'wheels', 'Debug', 'Release', 'deps', 'rag_assets'
     ]
-    return any(skip_dir in path.split(os.path.sep) for skip_dir in skip_directories)
-def save_file_trees(file_trees):
-    with open("./assets/file_trees.json", "w") as file:
+    skip = any(skip_dir in path.split(os.path.sep) for skip_dir in skip_directories)
+    return skip
+def save_file_trees(root_dir, file_trees):
+    file_path = os.path.join(os.path.abspath(root_dir), "rag_assets/file_trees.json")
+    path = os.path.dirname(file_path)
+    if not os.path.exists(path):
+        os.makedirs(path)
+    with open(os.path.join(file_path), "w+") as file:
         json.dump({k: v.to_dict() for k, v in file_trees.items()}, file, indent=4)
 
 def extract_component_name(file_path):
@@ -250,27 +281,29 @@ def extract_component_name(file_path):
     if match:
         return match.group(1)
     return None
-def process_codebase(root_directory):
+async def process_codebase(root_directory):
     init_tree_sitter_languages()
-    modules, file_sizes, package_names, file_trees, json_data = init_tree_sitter(root_directory)
-    save_file_trees(file_trees)
-    save_embeddings_db(embeddings_db)
+    modules, file_sizes, package_names, file_trees, json_data = await init_tree_sitter(root_directory)
+    #save_file_trees(root_directory, file_trees)
+    #save_embeddings_db(root_directory, embeddings_db)
     return "Codebase processing complete. Embeddings have been saved."
 
 
 
-def generate_embeddings(text, model=CODE_EMBEDDING_MODEL):
+async def generate_embeddings(text, model=CODE_EMBEDDING_MODEL):
     payload = json.dumps({"model": model, "prompt": text})
     headers = {'Content-Type': 'application/json'}
     try:
-        response = requests.post(EMBEDDING_API_URL, data=payload, headers=headers)
-        response.raise_for_status()
-        result = response.json()
-        embeddings = result.get('embedding')
-        if not embeddings:
-            logging.error(f"Invalid embedding format received. Expected 768 dimensions, got {len(embeddings) if embeddings else 'None'}")
-            return None
-        return np.array(embeddings, dtype=np.float32)
+        async with httpx.AsyncClient(verify=False, timeout=5.0) as client:
+            response = await client.post(EMBEDDING_API_URL, data=payload, headers=headers)
+            response.raise_for_status()
+            result = response.json()
+            embeddings = result.get('embedding')
+            if not embeddings:
+                logging.error(f"Invalid embedding format received. Expected 768 dimensions, got {len(embeddings) if embeddings else 'None'}")
+                return None
+            #logging.debug(f"embedding length: {len(embeddings)}")
+            return np.array(embeddings, dtype=np.float32)
     except Exception as e:
         logging.error(f"Error in generate_embeddings: {str(e)}")
         return None
@@ -344,22 +377,28 @@ def layered_query_embeddings(query_text, embeddings_db, file_trees, top_k=5, min
 
 
 
-def process_repository(repo_path, modules, file_trees, file_sizes, package_names, readme_info_list):
+async def process_repository(repo_path, modules, file_trees, file_sizes, package_names, readme_info_list):
     for root, dirs, files in os.walk(repo_path):
         if should_skip_path(root):
             continue
+        logging.debug(f"root: {root}")
+        logging.debug(f"dirs: {dirs}")
+        logging.debug(f"files: {files}")
 
         for file in files:
             file_path = os.path.join(root, file)
-            process_file(file_path, modules, file_trees, file_sizes, package_names, readme_info_list)
+            logging.debug(f"processing file: {file_path}")
+            await process_file(file_path, modules, file_trees, file_sizes, package_names, readme_info_list)
 
 
-def process_file(file_path, modules, file_trees, file_sizes, package_names, readme_info_list):
+async def process_file(file_path, modules, file_trees, file_sizes, package_names, readme_info_list):
     _, file_extension = os.path.splitext(file_path)
 
     for lang, (language_obj, extensions) in extension_to_language.items():
+        processed = False
         if file_extension in extensions:
             try:
+                processed = True
                 with open(file_path, "r", encoding="utf-8") as f:
                     file_content = f.read()
 
@@ -368,24 +407,25 @@ def process_file(file_path, modules, file_trees, file_sizes, package_names, read
                 package_names[file_path] = "/".join(os.path.relpath(file_path, start=os.path.dirname(file_path)).split(os.sep)[:-1])
                 file_sizes[file_path] = len(file_content.encode("utf-8")).__float__()
 
-                manage_embeddings(node_tree, file_path, embeddings_db)
+                await manage_embeddings(node_tree, file_path, embeddings_db)
 
                 repo_name = os.path.basename(os.path.dirname(file_path))
                 if repo_name not in modules:
                     modules[repo_name] = {}
                 modules[repo_name][file_path] = file_content
-
-                if "README" in file_path.upper():
-                    with open(file_path, 'r', encoding='utf-8') as file:
-                        content = file.read()
-                        readme_info_list.append({"id": os.path.basename(os.path.dirname(file_path)), "content": content})
+                
             except UnicodeDecodeError:
                 logging.warning(f"Skipping binary file: {file_path}")
                 continue
 
+    if "README" in file_path.upper() and not processed:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            content = file.read()
+            readme_info_list.append({"id": file_path, "content": content})
 
-def save_embeddings_db(embeddings_db):
-    with open(CODEBASE_DB_PATH, "w") as file:
+
+def save_embeddings_db(root_dir, embeddings_db):
+    with open(os.path.join(os.path.abspath(root_dir), CODEBASE_DB_PATH), "w+") as file:
         json.dump({k: v.tolist() for k, v in embeddings_db.items()}, file)
 
 def load_embeddings_db():
@@ -612,35 +652,77 @@ def extract_property_dependencies(node_tree):
             properties.append(property_name)
     return properties
 
-def manage_embeddings(tree_node, file_path, embeddings_db):
+# def manage_embeddings(tree_node, file_path, embeddings_db):
+#     for class_name in tree_node.class_names:
+#         key = f"class:{class_name}|path:{file_path}"
+#         embeddings_db[key] = generate_embeddings(f"{key}: {class_name}")
+
+#     for import_stmt in tree_node.imports:
+#         key = f"import:{import_stmt}|path:{file_path}"
+#         embeddings_db[key] = generate_embeddings(f"{key}: {import_stmt}")
+
+#     for export_stmt in tree_node.exports:
+#         key = f"export:{export_stmt}|path:{file_path}"
+#         embeddings_db[key] = generate_embeddings(f"{key}: {export_stmt}")
+
+#     for prop in tree_node.property_declarations:
+#         key = f"property:{prop}|path:{file_path}"
+#         embeddings_db[key] = generate_embeddings(f"{key}: {prop}")
+
+#     for func in tree_node.functions:
+#         key = f"function:{func.name}|class:{func.class_name}|path:{file_path}"
+#         embeddings_db[key] = generate_embeddings(f"{key}: {func.name}")
+
+#         body_chunks = chunk_text(func.body)
+#         for i, chunk in enumerate(body_chunks):
+#             key = f"function_{func.name}_body_chunk_{i}|class:{func.class_name}|path:{file_path}"
+#             embeddings_db[key] = generate_embeddings(f"{key}: {chunk}")
+
+
+async def manage_embeddings(tree_node, file_path, embeddings_db):
+    # Create a list to hold all tasks
+    tasks = []
+
     for class_name in tree_node.class_names:
         key = f"class:{class_name}|path:{file_path}"
-        embeddings_db[key] = generate_embeddings(f"{key}: {class_name}")
+        task = asyncio.create_task(add_embedding(key, generate_embeddings(f"{key}: {class_name}"), embeddings_db))
+        tasks.append(task)
 
     for import_stmt in tree_node.imports:
         key = f"import:{import_stmt}|path:{file_path}"
-        embeddings_db[key] = generate_embeddings(f"{key}: {import_stmt}")
+        task = asyncio.create_task(add_embedding(key, generate_embeddings(f"{key}: {import_stmt}"), embeddings_db))
+        tasks.append(task)
 
     for export_stmt in tree_node.exports:
         key = f"export:{export_stmt}|path:{file_path}"
-        embeddings_db[key] = generate_embeddings(f"{key}: {export_stmt}")
+        task = asyncio.create_task(add_embedding(key, generate_embeddings(f"{key}: {export_stmt}"), embeddings_db))
+        tasks.append(task)
 
     for prop in tree_node.property_declarations:
         key = f"property:{prop}|path:{file_path}"
-        embeddings_db[key] = generate_embeddings(f"{key}: {prop}")
+        task = asyncio.create_task(add_embedding(key, generate_embeddings(f"{key}: {prop}"), embeddings_db))
+        tasks.append(task)
 
     for func in tree_node.functions:
         key = f"function:{func.name}|class:{func.class_name}|path:{file_path}"
-        embeddings_db[key] = generate_embeddings(f"{key}: {func.name}")
+        task = asyncio.create_task(add_embedding(key, generate_embeddings(f"{key}: {func.name}"), embeddings_db))
+        tasks.append(task)
 
         body_chunks = chunk_text(func.body)
         for i, chunk in enumerate(body_chunks):
             key = f"function_{func.name}_body_chunk_{i}|class:{func.class_name}|path:{file_path}"
-            embeddings_db[key] = generate_embeddings(f"{key}: {chunk}")
+            task = asyncio.create_task(add_embedding(key, generate_embeddings(f"{key}: {chunk}"), embeddings_db))
+            tasks.append(task)
+
+    # Await all the tasks to complete and add their results to the database
+    await asyncio.gather(*tasks)
+
+async def add_embedding(key, embedding, embeddings_db):
+    embeddings_db[key] = await embedding
 
 def extended_retrieval(parsed_data, initial_files, top_k):
     # Compute dependency graph for initial_files
-    dependency_graph = process_full_graph('./assets/file_trees.json', initial_files)
+    dependency_graph = process_full_graph('./rag_assets/file_trees.json', initial_files)
     dependencies = {node['id'] for node in dependency_graph['nodes']}
 
     # Add dependencies to initial_files
@@ -666,7 +748,7 @@ def generate_individual_user_jsons(json_data):
         user_nodes_dict[user].append(node)
 
     script_location = pathlib.Path(__file__).parent.absolute()
-    assets_dir = script_location / 'assets/files'
+    assets_dir = script_location / 'rag_assets/files'
     assets_dir.mkdir(parents=True, exist_ok=True)
 
     file_json = {}
@@ -712,7 +794,7 @@ def generate_root_level_json(json_data):
     }
 
     script_location = pathlib.Path(__file__).parent.absolute()
-    assets_dir = script_location / 'assets'
+    assets_dir = script_location / 'rag_assets'
     assets_dir.mkdir(parents=True, exist_ok=True)
 
     file_path = assets_dir / 'repos_graph.json'
@@ -835,6 +917,8 @@ def load_requirements_db():
 
 # Main function to process codebase and requirements
 def main():
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     parser = argparse.ArgumentParser(description="Code Embedding Processor and Query System")
     parser.add_argument("mode", choices=["process", "query", "process_requirements"], help="Mode of operation: 'process' to analyze codebase, 'query' for interactive querying, 'process_requirements' to process only requirements")
     parser.add_argument("--root_dir", help="Root directory of the codebase (required for 'process' mode)")
@@ -846,7 +930,7 @@ def main():
         if not args.root_dir:
             print("Error: --root_dir is required for 'process' mode")
             sys.exit(1)
-        process_codebase(args.root_dir)
+        asyncio.run(process_codebase(args.root_dir))
         if args.requirements_csv:
             process_requirements(args.requirements_csv)
     elif args.mode == "process_requirements":
@@ -855,7 +939,7 @@ def main():
             sys.exit(1)
         process_requirements(args.requirements_csv)
     elif args.mode == "query":
-        file_trees_path = "./assets/file_trees.json"
+        file_trees_path = "./rag_assets/file_trees.json"
         if not os.path.exists(file_trees_path):
             print("Error: No file trees found. Please run in 'process' mode first.")
             sys.exit(1)

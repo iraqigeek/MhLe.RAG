@@ -49,7 +49,7 @@ for url, ref, clone_directory in repos:
 print()
 
 if sys.platform == "win32":
-    languages_filename = "tree_sitter_languages\\languages.dll"
+    languages_filename = "languages.dll"
 else:
     languages_filename = "tree_sitter_languages/languages.so"
 
@@ -64,7 +64,7 @@ try:
     Language.build_library(
         languages_filename,
         [
-            'vendor/tree-sitter-bash',
+            #'vendor/tree-sitter-bash',
             'vendor/tree-sitter-c',
             'vendor/tree-sitter-c-sharp',
             'vendor/tree-sitter-cpp',
@@ -82,7 +82,7 @@ try:
             'vendor/tree-sitter-rust',
             'vendor/tree-sitter-scala',
             'vendor/tree-sitter-toml',
-            'vendor/tree-sitter-swift'  # Ensure Swift parser is included here
+            #'vendor/tree-sitter-swift'  # Ensure Swift parser is included here
         ]
     )
 except Exception as e:
