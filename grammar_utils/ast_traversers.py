@@ -602,10 +602,13 @@ def traverse_tree_python(node, code, node_tree, language):
     query = language.query(query_string)
     captures = query.captures(node)
 
+    #ALI: revisit later if needed
+    '''
     should_traverse_children = True
     for capture_node, capture_name in captures:
         if capture_node == node:
             should_traverse_children = False
+    '''
 
     for capture_node, capture_index in captures:
         extracted_text = code[capture_node.start_byte : capture_node.end_byte].decode("utf-8").strip()
@@ -615,7 +618,10 @@ def traverse_tree_python(node, code, node_tree, language):
         elif capture_index == "import_from":
             module_name = ' '.join([node.text.decode('utf-8') for node in capture_node.named_children if node.type == 'identifier'])
             import_name = capture_node.child_by_field_name('name').text.decode('utf-8')
-            node_tree.imports.append(f"from {module_name} import {import_name}")
+            if module_name != '' and import_name != '':
+                node_tree.imports.append(f"from {module_name} import {import_name}")
+            else:
+                node_tree.imports.append(extracted_text)
         elif capture_index == "class":
             class_name_match = re.search(r'class\s+(\w+)', extracted_text)
             if class_name_match:
@@ -623,15 +629,18 @@ def traverse_tree_python(node, code, node_tree, language):
         elif capture_index == "function":
             function_details = extract_function_details_python(extracted_text)
             if function_details and not any(f.name == function_details.name for f in node_tree.functions):
+                if capture_node.parent is not None and capture_node.parent.parent is not None and capture_node.parent.parent.type =='class_definition':
+                    function_details.class_name = capture_node.parent.parent.child_by_field_name('name').text.decode('utf-8')
                 node_tree.functions.append(function_details)
+                
         elif capture_index == "variable":
             if not node_tree.functions and not node_tree.class_names:
                 node_tree.property_declarations.append(extracted_text)
-
+    '''
     if should_traverse_children:
         for child in node.children:
             traverse_tree_python(child, code, node_tree, language)
-
+    '''
 
 def extract_function_details_python(text):
     func_name_match = re.search(r'def\s+(\w+)\s*\(', text)
