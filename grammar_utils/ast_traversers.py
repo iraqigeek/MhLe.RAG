@@ -1,18 +1,20 @@
 import json
 import re
+import importlib.util
 
 ##### Model struture to hold parsed code #####
 
 class TreeNode:
-    def __init__(self, file_path=None, class_names=None, package_import_paths=None, package=None, imports=None, functions=None, property_declarations=None, exports=None):
+    def __init__(self, file_path=None, class_names=None, package_import_paths=None, package=None, imports=None, functions=None, property_declarations=None, exports=None, summary = None):
         self.file_path = file_path
         self.class_names = class_names or []
         self.package_import_paths = package_import_paths or {}
-        self.package = package
+        self.package = package or {}
         self.imports = imports or []
         self.exports = exports or []
         self.property_declarations = property_declarations or []
         self.functions = functions or []
+        self.summary = summary or ''
 
     def to_dict(self):
         return {
@@ -23,7 +25,8 @@ class TreeNode:
             "package_import_paths": self.package_import_paths,
             "package": self.package,
             "property_declarations": self.property_declarations,
-            "functions": [func.to_dict() for func in self.functions]
+            "functions": [func.to_dict() for func in self.functions],
+            "summary": self.summary
         }
 
     def __repr__(self):
@@ -35,14 +38,15 @@ class TreeNode:
         )
 
 class FunctionNode:
-    def __init__(self, name, parameters, return_type, body, is_abstract=False, class_names=None, annotations=None):
+    def __init__(self, name, parameters, return_type, body, is_abstract=False, class_names=None, annotations=None, summary=None):
         self.name = name
         self.parameters = parameters or []
         self.return_type = return_type
         self.body = body
         self.is_abstract = is_abstract
         self.class_name = " ".join(class_names) if class_names else ""
-        self.annotations = annotations or []
+        self.annotations = annotations or [],
+        self.summary = summary or ''
 
     def to_dict(self):
         body = self.body.decode("utf-8") if isinstance(self.body, bytes) else self.body
@@ -54,6 +58,7 @@ class FunctionNode:
             "is_abstract": self.is_abstract,
             "class_name": self.class_name,
             "annotations": self.annotations,
+            "summary": self.summary
         }
 
     def __repr__(self):
@@ -63,6 +68,7 @@ class FunctionNode:
             f"{self.return_type}\n------ Body:\t{self.body}"
             f"\n------ Abstract:\t{self.is_abstract}\n"
             f"\n------ Annotations:\t{self.annotations}\n------ Class Name:\t{self.class_name}"
+            f"\n------ Summary:\t{self.summary}"
         )
 
     def to_json(self):
@@ -591,13 +597,14 @@ def append_to_package_import_paths(package, name, node_tree):
     node_tree.package_import_paths[package_import_path] = package_import_path
 
 
-def traverse_tree_python(node, code, node_tree, language):
+def traverse_tree_python(node, code, node_tree, language, parser):
     query_string = """
     (import_from_statement) @import_from
     (import_statement) @import
     (class_definition) @class
     (function_definition) @function
     (assignment) @variable
+    (decorator) @decorator
     """
     query = language.query(query_string)
     captures = query.captures(node)
@@ -610,30 +617,50 @@ def traverse_tree_python(node, code, node_tree, language):
             should_traverse_children = False
     '''
 
-    for capture_node, capture_index in captures:
-        extracted_text = code[capture_node.start_byte : capture_node.end_byte].decode("utf-8").strip()
+    for node, index in captures:
+        extracted_text = code[node.start_byte : node.end_byte].decode("utf-8").strip()
 
-        if capture_index == "import":
-            node_tree.imports.append(extracted_text)
-        elif capture_index == "import_from":
-            module_name = ' '.join([node.text.decode('utf-8') for node in capture_node.named_children if node.type == 'identifier'])
-            import_name = capture_node.child_by_field_name('name').text.decode('utf-8')
+        if index == "import":
+            import_parts = node.text.decode('utf-8').split()
+            import_parts.remove('import')
+            item = import_parts[0]
+            node_tree.imports.append(item)
+        elif index == "import_from":
+            parts = [child.text.decode() for child in node.children if child.type == 'dotted_name']
+            module_name = parts[0]
+            for import_name in parts[1:]:
+                spec = importlib.util.find_spec(module_name)
+                with open(spec.origin, 'r') as file:
+                    source_code = file.read()
+                module_tree = parser.parse(bytes(source_code, "utf8"))
+                if module_name not in node_tree.package:
+                    
+                    module_query = language.query("(module . (expression_statement (string) @docstring))")
+                    module_captures = module_query.captures(module_tree.root_node)
+                    node_tree.package[module_name] =  ''.join([n.text.decode('utf-8') for n, na in module_captures])
+
+                import_full_name = module_name +'.' + import_name
+                if import_full_name not in node_tree.imports:
+                    function_query = language.query("(function_definition body: (block . (expression_statement (string) @docstring)))")
+                    function_captures = function_query.captures(module_tree.root_node)
+                    node_tree.package[import_full_name] = ''.join([n.text.decode('utf-8')  for n, na in function_captures for p in n.parent.parent.parent.children if p.type == 'identifier' and p.text.decode('utf-8')== import_name])
+
             if module_name != '' and import_name != '':
                 node_tree.imports.append(f"from {module_name} import {import_name}")
             else:
                 node_tree.imports.append(extracted_text)
-        elif capture_index == "class":
+        elif index == "class":
             class_name_match = re.search(r'class\s+(\w+)', extracted_text)
             if class_name_match:
                 node_tree.class_names.append(class_name_match.group(1))
-        elif capture_index == "function":
+        elif index == "function":
             function_details = extract_function_details_python(extracted_text)
             if function_details and not any(f.name == function_details.name for f in node_tree.functions):
-                if capture_node.parent is not None and capture_node.parent.parent is not None and capture_node.parent.parent.type =='class_definition':
-                    function_details.class_name = capture_node.parent.parent.child_by_field_name('name').text.decode('utf-8')
+                if node.parent is not None and node.parent.parent is not None and node.parent.parent.type =='class_definition':
+                    function_details.class_name = node.parent.parent.child_by_field_name('name').text.decode('utf-8')
                 node_tree.functions.append(function_details)
                 
-        elif capture_index == "variable":
+        elif index == "variable":
             if not node_tree.functions and not node_tree.class_names:
                 node_tree.property_declarations.append(extracted_text)
     '''

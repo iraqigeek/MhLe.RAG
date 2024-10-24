@@ -1,16 +1,16 @@
 import os
-import glob
+#import glob
 import sys
 import re
 import csv
 import json
 import argparse
 import pathlib
-import tiktoken
+#import tiktoken
 import logging
 import networkx as nx
 import numpy as np
-import requests
+#import requests
 import asyncio
 import httpx
 from scipy.spatial.distance import cosine
@@ -26,10 +26,14 @@ from grammar_utils.ast_traversers import (
 
 # Ollama backend-- update accordingly.
 EMBEDDING_API_URL = "http://localhost:11434/api/embeddings"
-LLM_API_URL = "http://localhost:11434/api/generate"
+LLM_API_URL = "http://localhost:11434/v1/chat/completions"
 CODEBASE_DB_PATH = "rag_assets/codebase_embeddings.db"
+FILE_TREE_PATH = "rag_assets/file_trees.json"
+FILE_GRAPH_PATH = "rag_assets/full_graph.json"
+REPO_README_PATH = "rag_assets/repos_readme.json"
 REQUIREMENTS_DB_PATH = "rag_assets/requirements_embeddings.db"
 CODE_EMBEDDING_MODEL = "mxbai-embed-large:latest" #768dim
+CODE_SUMMERIZATION_MODEL = "qwen2.5-coder:latest"
 REQUIREMENT_EMBEDDING_MODEL = "mxbai-embed-large:latest" #768dim
 logging.basicConfig(level=logging.DEBUG)
 
@@ -57,10 +61,10 @@ def has_extension(file_path, extensions):
     return False
 
 # I've yet to research on the feasibility of differents encoders being a better fit in this project (over gpt-4)
-enc = tiktoken.encoding_for_model("gpt-4")
+#enc = tiktoken.encoding_for_model("gpt-4")
 
-def count_tokens(text):
-    return len(enc.encode(text))
+#def count_tokens(text):
+#    return len(enc.encode(text))
 
 
 def create_language(name):
@@ -192,7 +196,7 @@ def process_code_string(code_string, language, file_path):
     elif language.name == "go":
         traverse_tree_go(root_node, bytes(code_string, "utf8"), node_tree, language)
     elif language.name == "python":
-        traverse_tree_python(root_node, bytes(code_string, "utf8"), node_tree, language)
+        traverse_tree_python(root_node, bytes(code_string, "utf8"), node_tree, language, parser)
     elif language.name == "cpp":
         traverse_tree_cpp(root_node, bytes(code_string, "utf8"), node_tree, language)
     elif language.name == "c":
@@ -204,7 +208,45 @@ def process_code_string(code_string, language, file_path):
 
     return node_tree
 
-async def init_tree_sitter(root_dir):
+def load_file_trees(file_path):
+    if os.path.exists(file_path):
+        with open(file_path, "r") as file:
+            return json.load(file)
+    return {}
+
+def should_skip_path(path):
+    skip_directories = [
+        '.venv','node_modules', 'build', 'dist', 'out', 'bin', '.git', '.svn', '.vscode',
+        '__pycache__', '.idea', 'obj', 'lib', 'vendor', 'target', '.next', 'pkg',
+        'venv', '.tox', 'wheels', 'Debug', 'Release', 'deps', 'rag_assets'
+    ]
+    skip = any(skip_dir in path.split(os.path.sep) for skip_dir in skip_directories)
+    return skip
+def save_file_trees(root_dir, file_trees):
+    file_path = os.path.join(os.path.abspath(root_dir), FILE_TREE_PATH)
+    path = os.path.dirname(file_path)
+    if not os.path.exists(path):
+        os.makedirs(path)
+    with open(os.path.join(file_path), "w+") as file:
+        json.dump({k: v.to_dict() for k, v in file_trees.items()}, file, indent=4)
+
+def extract_component_name(file_path):
+    match = re.search(r"/([^/]+)/(?:app/)?src/", file_path)
+    if match:
+        return match.group(1)
+    return None
+
+def save_file_graph(root_dir, graph_data):
+    with open(os.path.join(root_dir, FILE_GRAPH_PATH), "w+") as outfile:
+        json.dump(graph_data, outfile, indent=4, sort_keys=True)
+
+def save_repo_readme(root_dir, readme_info_list):
+    with open(os.path.join(root_dir, REPO_README_PATH), 'w', encoding='utf-8') as file:
+        json.dump(readme_info_list, file, ensure_ascii=False, indent=4)
+
+async def process_codebase(root_dir):
+    init_tree_sitter_languages()
+    
     modules = {}
     file_trees = {}
     file_sizes = {}
@@ -240,78 +282,72 @@ async def init_tree_sitter(root_dir):
     save_file_trees(root_dir, file_trees)
     save_embeddings_db(root_dir, embeddings_db)
 
-    json_data = process_full_graph("./rag_assets/file_trees.json")
+    json_data = process_full_graph(file_trees)
 
-    with open("./rag_assets/full_graph.json", "w") as outfile:
-        json.dump(json_data, outfile, indent=4, sort_keys=True)
+    
+    save_file_graph(root_dir, json_data)
 
-    with open("./rag_assets/repos_readme.json", 'w', encoding='utf-8') as file:
-        json.dump(readme_info_list, file, ensure_ascii=False, indent=4)
+    save_repo_readme(root_dir, readme_info_list)    
 
     generate_individual_user_jsons(json_data)
     generate_root_level_json(json_data)
 
-    return modules, file_sizes, package_names, file_trees, json_data
+    #return modules, file_sizes, package_names, file_trees, json_data
+    
+    print("Codebase processing complete. Embeddings have been saved.")
 
-def load_file_trees():
-    file_path = "./rag_assets/file_trees.json"
-    if os.path.exists(file_path):
-        with open(file_path, "r") as file:
-            return json.load(file)
-    return {}
-
-def should_skip_path(path):
-    skip_directories = [
-        '.venv','node_modules', 'build', 'dist', 'out', 'bin', '.git', '.svn', '.vscode',
-        '__pycache__', '.idea', 'obj', 'lib', 'vendor', 'target', '.next', 'pkg',
-        'venv', '.tox', 'wheels', 'Debug', 'Release', 'deps', 'rag_assets'
-    ]
-    skip = any(skip_dir in path.split(os.path.sep) for skip_dir in skip_directories)
-    return skip
-def save_file_trees(root_dir, file_trees):
-    file_path = os.path.join(os.path.abspath(root_dir), "rag_assets/file_trees.json")
-    path = os.path.dirname(file_path)
-    if not os.path.exists(path):
-        os.makedirs(path)
-    with open(os.path.join(file_path), "w+") as file:
-        json.dump({k: v.to_dict() for k, v in file_trees.items()}, file, indent=4)
-
-def extract_component_name(file_path):
-    match = re.search(r"/([^/]+)/(?:app/)?src/", file_path)
-    if match:
-        return match.group(1)
-    return None
-async def process_codebase(root_directory):
-    init_tree_sitter_languages()
-    modules, file_sizes, package_names, file_trees, json_data = await init_tree_sitter(root_directory)
-    #save_file_trees(root_directory, file_trees)
-    #save_embeddings_db(root_directory, embeddings_db)
-    return "Codebase processing complete. Embeddings have been saved."
-
-
-
-async def generate_embeddings(text, model=CODE_EMBEDDING_MODEL):
-    payload = json.dumps({"model": model, "prompt": text})
+async def generate_embeddings(text, embedding_model=CODE_EMBEDDING_MODEL):
     headers = {'Content-Type': 'application/json'}
+    embeddings = None; summary = None
     try:
-        async with httpx.AsyncClient(verify=False, timeout=5.0) as client:
-            response = await client.post(EMBEDDING_API_URL, data=payload, headers=headers)
+        async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
+            embedding_payload = json.dumps({"model": embedding_model, "prompt": text})
+            response = await client.post(EMBEDDING_API_URL, data=embedding_payload, headers=headers)
             response.raise_for_status()
             result = response.json()
             embeddings = result.get('embedding')
             if not embeddings:
                 logging.error(f"Invalid embedding format received. Expected 768 dimensions, got {len(embeddings) if embeddings else 'None'}")
-                return None
-            #logging.debug(f"embedding length: {len(embeddings)}")
-            return np.array(embeddings, dtype=np.float32)
+            else:
+                embeddings = np.array(embeddings, dtype=np.float32)
     except Exception as e:
         logging.error(f"Error in generate_embeddings: {str(e)}")
         return None
+    return embeddings, summary
 
+async def generate_summaries(text, summary_model=CODE_SUMMERIZATION_MODEL):
+    headers = {'Content-Type': 'application/json'}
+    summary = None
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=300.0) as client:
+            prompt = """Act as an expert software developer.
+generate a summary text of the following function that describe what the function does, what parameters it takes as input, 
+what is the meaning/role/function of each parameter, 
+and what it generates or returns also describing the meaning/role/function of each return parameter, 
+along with any data types if the datatype is clear or can be inferred without doubt.
+Your answer should contain only the summary text without any additional information.
+"""
+            data = {
+                'model': summary_model,
+                'stream': False,
+                'messages': [
+                    {'role': 'system', 'content': prompt},
+                    {'role': 'user', 'content': text}
+                ]
+            }
+            response = await client.post(LLM_API_URL, data=json.dumps(data), headers=headers)
+            response.raise_for_status()
+            result = response.json()
+            summary = result.get('choices')[0]['message']['content']
+            if not summary:
+                logging.error(f"Empty summary received!")
+    except Exception as e:
+        logging.error(f"Error in generate_embeddings: {str(e)}")
+        return None
+    return summary
 
-
-def query_embeddings(query_text, code_embeddings_db, requirements_db, file_trees, top_k=5):
-    file_trees = load_file_trees()
+def query_embeddings(root_dir, query_text, code_embeddings_db, requirements_db, file_trees, top_k=5):
+    file_trees = load_file_trees(os.path.join(root_dir, FILE_TREE_PATH))
     query_embedding = generate_embeddings(query_text)
     if query_embedding is None:
         return [], []
@@ -428,9 +464,9 @@ def save_embeddings_db(root_dir, embeddings_db):
     with open(os.path.join(os.path.abspath(root_dir), CODEBASE_DB_PATH), "w+") as file:
         json.dump({k: v.tolist() for k, v in embeddings_db.items()}, file)
 
-def load_embeddings_db():
-    if os.path.exists(CODEBASE_DB_PATH):
-        with open(CODEBASE_DB_PATH, "r") as file:
+def load_embeddings_db(file_path):
+    if os.path.exists(file_path):
+        with open(file_path, "r") as file:
             return {k: np.array(v) for k, v in json.load(file).items()}
     return {}
 
@@ -581,13 +617,13 @@ def format_top_repos(top_repos, top_k):
 
 embeddings_db = {}
 
-def process_full_graph(full_graph_path, file_paths=None):
-    with open(full_graph_path, 'r') as file:
-        parsed_data = json.load(file)
-
+def process_full_graph(file_tree, file_paths=None):
+    
     if file_paths:
-        parsed_data = {k: v for k, v in parsed_data.items() if k in file_paths}
-        logging.info(f"Filtered parsed_data: {parsed_data}")
+        parsed_data = {k: v for k, v in file_tree.items() if k in file_paths}
+        #logging.info(f"Filtered parsed_data: {parsed_data}")
+    else:
+        parsed_data = {k: v for k, v in file_tree.items()}
 
     links = set()
     dependencies = {}
@@ -707,22 +743,28 @@ async def manage_embeddings(tree_node, file_path, embeddings_db):
         key = f"function:{func.name}|class:{func.class_name}|path:{file_path}"
         task = asyncio.create_task(add_embedding(key, generate_embeddings(f"{key}: {func.name}"), embeddings_db))
         tasks.append(task)
+        task = asyncio.create_task(add_summary(key, generate_summaries(f"{key}: {func.body}"), func))
+        tasks.append(task)
 
-        body_chunks = chunk_text(func.body)
-        for i, chunk in enumerate(body_chunks):
-            key = f"function_{func.name}_body_chunk_{i}|class:{func.class_name}|path:{file_path}"
-            task = asyncio.create_task(add_embedding(key, generate_embeddings(f"{key}: {chunk}"), embeddings_db))
-            tasks.append(task)
+        #body_chunks = chunk_text(func.body)
+        #for i, chunk in enumerate(body_chunks):
+        #    key = f"function_{func.name}_body_chunk_{i}|class:{func.class_name}|path:{file_path}"
+        #    task = asyncio.create_task(add_embedding(key, generate_embeddings(f"{key}: {chunk}"), embeddings_db))
+        #    tasks.append(task)
 
     # Await all the tasks to complete and add their results to the database
     await asyncio.gather(*tasks)
 
-async def add_embedding(key, embedding, embeddings_db):
-    embeddings_db[key] = await embedding
+async def add_embedding(key, func, embeddings_db):
+    embeddings_db[key] = await func
 
-def extended_retrieval(parsed_data, initial_files, top_k):
+async def add_summary(key, func, tree_func):
+    tree_func.summary = await func
+
+def extended_retrieval(file_tree, top_k, root_dir):
     # Compute dependency graph for initial_files
-    dependency_graph = process_full_graph('./rag_assets/file_trees.json', initial_files)
+    initial_files = sorted(file_tree.keys())
+    dependency_graph = process_full_graph(file_tree, initial_files)
     dependencies = {node['id'] for node in dependency_graph['nodes']}
 
     # Add dependencies to initial_files
@@ -812,10 +854,10 @@ def calculate_link_counts(nodes, links):
             link_counts[link['target']] += 1
     return link_counts
 
-def interactive_query_mode(file_trees_path):
-    file_trees = load_file_trees()
-    embeddings_db = load_embeddings_db()
-    requirements_db = load_requirements_db()
+def interactive_query_mode(root_dir):
+    file_trees = load_file_trees(os.path.join(root_dir, FILE_TREE_PATH))
+    embeddings_db = load_embeddings_db(os.path.join(root_dir,CODEBASE_DB_PATH))
+    requirements_db = load_requirements_db(os.path.join(root_dir, REQUIREMENTS_DB_PATH))
 
     print("Embeddings loaded. Ready for queries.")
     print("Enter your queries (type 'exit' to quit):")
@@ -829,8 +871,7 @@ def interactive_query_mode(file_trees_path):
 
         # Step 1: Extended Retrieval using the dependency graph
         print("\nExtended Retrieval Phase")
-        logging.info("Starting extended retrieval phase")
-        extended_files = extended_retrieval(file_trees, sorted(file_trees.keys()), top_k)
+        extended_files = extended_retrieval(file_trees, top_k, root_dir)
         logging.info(f"Extended files retrieved: {extended_files}")
 
         # Step 2: Query using the extended files
@@ -888,7 +929,7 @@ def process_requirements(csv_file_path):
             for row in csvreader:
                 requirement_id = row["Project ID"]
                 description = row["Description"]
-                embedding = generate_embeddings(description, model=REQUIREMENT_EMBEDDING_MODEL)
+                embedding = generate_embeddings(description, embedding_model=REQUIREMENT_EMBEDDING_MODEL)
                 if embedding is not None:
                     requirements_db[requirement_id] = {
                         "embedding": embedding.tolist(),
@@ -907,13 +948,22 @@ def save_requirements_db(requirements_db):
         json.dump(requirements_db, file)
 
 # Function to load requirements embeddings from disk
-def load_requirements_db():
-    if os.path.exists(REQUIREMENTS_DB_PATH):
-        with open(REQUIREMENTS_DB_PATH, "r") as file:
+def load_requirements_db(file_path):
+    if os.path.exists(file_path):
+        with open(file_path, "r") as file:
             return json.load(file)
     return {}
 
+def decorator(func):
+    def wrapper():
+        print("Something is happening before the function is called.")
+        func()
+        print("Something is happening after the function is called.")
+    return wrapper
 
+@decorator
+def say_whee():
+    print("Whee!")
 
 # Main function to process codebase and requirements
 def main():
@@ -939,11 +989,15 @@ def main():
             sys.exit(1)
         process_requirements(args.requirements_csv)
     elif args.mode == "query":
-        file_trees_path = "./rag_assets/file_trees.json"
+        if not args.root_dir:
+            print("Error: --root_dir is required for 'query' mode")
+            sys.exit(1)
+        file_trees_path = os.path.join(os.path.abspath(args.root_dir), FILE_TREE_PATH)
         if not os.path.exists(file_trees_path):
             print("Error: No file trees found. Please run in 'process' mode first.")
             sys.exit(1)
-        interactive_query_mode(file_trees_path)
+        interactive_query_mode(args.root_dir)
 
+    say_whee()
 if __name__ == "__main__":
     main()
