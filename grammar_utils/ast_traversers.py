@@ -1,16 +1,23 @@
+import importlib.util
+import inspect
+import os
+import sys
+import re
 import json
 import re
 import importlib.util
+import sysconfig
 
 ##### Model struture to hold parsed code #####
 
 class TreeNode:
-    def __init__(self, file_path=None, class_names=None, package_import_paths=None, package=None, imports=None, functions=None, property_declarations=None, exports=None, summary = None):
+    def __init__(self, file_path=None, class_names=None, package_import_paths=None, package=None, imports=None, import_objects = None, functions=None, property_declarations=None, exports=None, summary = None):
         self.file_path = file_path
         self.class_names = class_names or []
         self.package_import_paths = package_import_paths or {}
-        self.package = package or {}
+        self.package = package or []
         self.imports = imports or []
+        self.import_objects = import_objects or []
         self.exports = exports or []
         self.property_declarations = property_declarations or []
         self.functions = functions or []
@@ -21,6 +28,7 @@ class TreeNode:
             "file_path": self.file_path,
             "class_names": self.class_names,
             "imports": self.imports,
+            "import_objects": self.import_objects,
             "exports": self.exports,
             "package_import_paths": self.package_import_paths,
             "package": self.package,
@@ -29,53 +37,68 @@ class TreeNode:
             "summary": self.summary
         }
 
-    def __repr__(self):
-        functions = "\n\n".join([str(func) for func in self.functions])
-        return (
-            f"TreeNode:\nFile Path:{self.file_path}\nClass Names: {self.class_names}\n"
-            f"Imports: {self.imports}\nExports: {self.exports}\nProperties: {self.property_declarations}\n"
-            f"Functions:\n{functions}\nPackage Paths:{self.package_import_paths}\nPackage: {self.package}"
-        )
+    # def __repr__(self):
+    #     functions = "\n\n".join([str(func) for func in self.functions])
+    #     return (
+    #         f"TreeNode:\nFile Path:{self.file_path}\nClass Names: {self.class_names}\n"
+    #         f"Imports: {self.imports}\nExports: {self.exports}\nProperties: {self.property_declarations}\n"
+    #         f"Functions:\n{functions}\nPackage Paths:{self.package_import_paths}\nPackage: {self.package}"
+    #     )
 
 class FunctionNode:
-    def __init__(self, name, parameters, return_type, body, is_abstract=False, class_names=None, annotations=None, summary=None):
+    def __init__(self, name, parameters, return_type, body, function_calls = None, is_abstract=False, class_names=None, annotations=None, summary=None):
         self.name = name
         self.parameters = parameters or []
         self.return_type = return_type
         self.body = body
+        self.function_calls = function_calls or []
         self.is_abstract = is_abstract
         self.class_name = " ".join(class_names) if class_names else ""
         self.annotations = annotations or [],
         self.summary = summary or ''
 
     def to_dict(self):
-        body = self.body.decode("utf-8") if isinstance(self.body, bytes) else self.body
         return {
             "name": self.name,
             "parameters": self.parameters,
             "return_type": self.return_type,
-            "body": body,
+            "body": self.body,
+            "function_calls": self.function_calls,
             "is_abstract": self.is_abstract,
             "class_name": self.class_name,
             "annotations": self.annotations,
             "summary": self.summary
         }
 
-    def __repr__(self):
-        parameter_str = ", ".join(self.parameters)
-        return (
-            f"\n\n------ Name: {self.name}\n------ Parameters: {parameter_str}\n------ Return Type: "
-            f"{self.return_type}\n------ Body:\t{self.body}"
-            f"\n------ Abstract:\t{self.is_abstract}\n"
-            f"\n------ Annotations:\t{self.annotations}\n------ Class Name:\t{self.class_name}"
-            f"\n------ Summary:\t{self.summary}"
-        )
+    # def __repr__(self):
+    #     parameter_str = ", ".join(self.parameters)
+    #     return (
+    #         f"\n\n------ Name: {self.name}\n------ Parameters: {parameter_str}\n------ Return Type: "
+    #         f"{self.return_type}\n------ Body:\t{self.body}"
+    #         f"\n------ Abstract:\t{self.is_abstract}\n"
+    #         f"\n------ Annotations:\t{self.annotations}\n------ Class Name:\t{self.class_name}"
+    #         f"\n------ Summary:\t{self.summary}"
+    #     )
 
     def to_json(self):
         if isinstance(self.body, bytes):
             self.body = self.body.decode("utf-8")
         return json.dumps(self.__dict__, indent=4)
 
+class ImportNode:
+    def __init__(self, name, file_path, alias = None, docstring = None):
+        self.name = name
+        self.file_path = file_path or None
+        self.alias = alias or None
+        self.docstring = docstring or None
+        
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "file_path": self.file_path,
+            "alias": self.alias,
+            "docstring": self.docstring,
+        }
 
 
 
@@ -597,6 +620,117 @@ def append_to_package_import_paths(package, name, node_tree):
     node_tree.package_import_paths[package_import_path] = package_import_path
 
 
+def get_python_source_file(module_name):
+    #First check it's not a built-in module
+    if module_name in sys.builtin_module_names:
+        return None
+    # Then attempt to get the source file using inspect
+    try:
+        module = importlib.import_module(module_name)
+        source_file = inspect.getfile(module)
+        if source_file.endswith('.py'):
+            return source_file
+    except TypeError:
+        pass  # `inspect.getfile` might fail for built-in or compiled modules
+
+    # Fallback to importlib's spec and try to locate the .py file
+    spec = importlib.util.find_spec(module_name)
+    if spec and spec.origin:
+        # Strip extensions and extra tags for potential .py counterpart
+        # Pattern to match .pyd, .so, or other compiled module extensions with possible tags
+        base_name = re.sub(r'\.cp\d{2,}.*$', '', spec.origin)  # Remove version and platform tags
+        if os.path.isfile(base_name + ".py"):
+            return base_name + ".py"
+        elif os.path.isfile(base_name + ".pyi"):
+            return base_name + ".pyi"
+
+    return None  # If no source file is found
+
+def find_python_import_name_recursively(module_name, import_name, node_tree, parser, language):
+    # Load the module
+    file_name = get_python_source_file(module_name)
+    if not file_name:
+        return None  # Module not found or cannot be located
+    if sysconfig.get_path('stdlib') in file_name:
+        return None  # Skip standard library modules
+
+    with open(file_name, 'r') as file:
+        source_code = file.read()
+
+    module_tree = parser.parse(bytes(source_code, "utf8"))
+
+    # Add module package to node_tree if not present
+    if module_name not in node_tree.package:
+        module_query = language.query("(module . (expression_statement (string) @docstring))")
+        module_captures = module_query.captures(module_tree.root_node)
+        node_tree.package.append(ImportNode(module_name, file_name, ''.join([n.text.decode('utf-8') for n, na in module_captures]))
+
+    if import_name:
+        # Look for the specified import_name
+        import_full_name = f"{module_name}.{import_name}"
+        if import_full_name not in node_tree.imports: 
+            # Check function definitions
+            function_query = language.query("(function_definition) @function")
+            module_captures = function_query.captures(module_tree.root_node)
+            matches = [
+                n
+                for n, _ in module_captures
+                for p in n.children
+                if p.type == 'identifier' and p.text.decode('utf-8') == import_name
+            ]
+            if matches:
+                docstring_query = language.query("(function_definition body: (block . (expression_statement (string) @docstring)))")
+                docstring_captures = docstring_query.captures(matches[0])
+                node_tree.package[import_full_name] = ''.join([n.text.decode('utf-8') for n,_ in docstring_captures])
+                node_tree.import_objects.append(('function', module_name, import_name))
+                return node_tree.package[import_full_name]
+            #else:
+            #    node_tree.package[import_full_name] = ''
+
+
+            # Check class definitions if not found in functions
+            class_query = language.query("(class_definition body: (block . (expression_statement (string) @docstring)))")
+            class_root = [n for n in module_tree.root_node.children 
+                        for cn in n.children 
+                        if n.type =='class_definition' 
+                        if cn.type =='identifier' and cn.text.decode('utf-8') == import_name]
+            if class_root:
+                module_captures = class_query.captures(class_root[0])
+                matches = [
+                    n.text.decode('utf-8')
+                    for n, _ in module_captures
+                    for p in n.parent.parent.parent.children
+                    if p.type == 'identifier' and p.text.decode('utf-8') == import_name
+                ]
+                if matches:
+                    node_tree.package[import_full_name] = ''.join(matches)
+                    
+                else: 
+                    node_tree.package[import_full_name] = ''
+                node_tree.import_objects.append(('class', module_name, import_name))
+                return node_tree.package[import_full_name]
+        # If not found, check recursively in imported modules
+        import_query = language.query("(import_statement) @import (import_from_statement) @import_from")
+        import_captures = import_query.captures(module_tree.root_node)
+        matches = [(n.children[1].text.decode('utf-8'), p.text.decode('utf-8'))  
+                for n, na in import_captures 
+                for p in n.children[2:] 
+                if p.text.decode('utf-8')== import_name
+                ]
+        if len(matches) > 0:
+            for m, i in matches:
+                result = find_python_import_name_recursively(m, i, node_tree, parser, language)
+                if result:
+                    return result
+        for import_node, _ in import_captures:
+            imported_module = [n.text.decode('utf-8') for n in import_node.children if n.type == 'dotted_name'][0]
+            result = find_python_import_name_recursively(imported_module, import_name, node_tree, parser, language)
+            if result:
+                return result
+
+        # Return None if nothing is found
+        return None
+
 def traverse_tree_python(node, code, node_tree, language, parser):
     query_string = """
     (import_from_statement) @import_from
@@ -621,40 +755,42 @@ def traverse_tree_python(node, code, node_tree, language, parser):
         extracted_text = code[node.start_byte : node.end_byte].decode("utf-8").strip()
 
         if index == "import":
-            import_parts = node.text.decode('utf-8').split()
-            import_parts.remove('import')
-            item = import_parts[0]
-            node_tree.imports.append(item)
+            import_alias = [i.text.decode('utf-8') 
+                            for n in node.children 
+                            for i in n.children 
+                            if n.type == 'aliased_import' 
+                            and i.type == 'identifier'
+                            ]
+            import_name = [i.text.decode('utf-8') 
+                           for n in node.children 
+                           for i in n.children 
+                           if n.type == 'aliased_import' 
+                           and i.type == 'dotted_name'
+                           ]
+            if not import_name and not import_alias:
+                import_name = [n.text.decode('utf-8') 
+                               for n in node.children  
+                               if n.type ==  'dotted_name'
+                               ]
+            if import_name:
+                find_python_import_name_recursively(import_name[0], None, node_tree, parser, language)
+            node_tree.imports.append(node.text.decode('utf-8'))
+
         elif index == "import_from":
             parts = [child.text.decode() for child in node.children if child.type == 'dotted_name']
             module_name = parts[0]
             for import_name in parts[1:]:
-                spec = importlib.util.find_spec(module_name)
-                with open(spec.origin, 'r') as file:
-                    source_code = file.read()
-                module_tree = parser.parse(bytes(source_code, "utf8"))
-                if module_name not in node_tree.package:
-                    
-                    module_query = language.query("(module . (expression_statement (string) @docstring))")
-                    module_captures = module_query.captures(module_tree.root_node)
-                    node_tree.package[module_name] =  ''.join([n.text.decode('utf-8') for n, na in module_captures])
-
-                import_full_name = module_name +'.' + import_name
-                if import_full_name not in node_tree.imports:
-                    function_query = language.query("(function_definition body: (block . (expression_statement (string) @docstring)))")
-                    function_captures = function_query.captures(module_tree.root_node)
-                    node_tree.package[import_full_name] = ''.join([n.text.decode('utf-8')  for n, na in function_captures for p in n.parent.parent.parent.children if p.type == 'identifier' and p.text.decode('utf-8')== import_name])
-
-            if module_name != '' and import_name != '':
-                node_tree.imports.append(f"from {module_name} import {import_name}")
-            else:
-                node_tree.imports.append(extracted_text)
+                result = find_python_import_name_recursively(module_name, import_name, node_tree, parser, language)
+                if module_name != '' and import_name != '':
+                    node_tree.imports.append(f"from {module_name} import {import_name}")
+                else:
+                    node_tree.imports.append(extracted_text)
         elif index == "class":
             class_name_match = re.search(r'class\s+(\w+)', extracted_text)
             if class_name_match:
                 node_tree.class_names.append(class_name_match.group(1))
         elif index == "function":
-            function_details = extract_function_details_python(extracted_text)
+            function_details = extract_function_details_python(node, language)
             if function_details and not any(f.name == function_details.name for f in node_tree.functions):
                 if node.parent is not None and node.parent.parent is not None and node.parent.parent.type =='class_definition':
                     function_details.class_name = node.parent.parent.child_by_field_name('name').text.decode('utf-8')
@@ -669,21 +805,31 @@ def traverse_tree_python(node, code, node_tree, language, parser):
             traverse_tree_python(child, code, node_tree, language)
     '''
 
-def extract_function_details_python(text):
-    func_name_match = re.search(r'def\s+(\w+)\s*\(', text)
-    if func_name_match:
-        func_name = func_name_match.group(1)
-        parameters_match = re.search(r'\((.*?)\)', text)
-        parameters = parameters_match.group(1).strip() if parameters_match else ""
-        func_body_match = re.search(r':\s*\n(.*?)(^\s*$|\Z)', text, re.DOTALL | re.MULTILINE)
-        func_body = func_body_match.group(1).strip() if func_body_match else ""
+def extract_function_details_python(node, language):
+    body_node = [n for n in node.children if n.type == 'block'][0]
+    function_calls = [c.text 
+                      for n,_ in language.query("(call) @call").captures(body_node) 
+                      for c in n.children 
+                      if c.type =='identifier' or c.type == 'attribute'
+                      ]
+    body_text = body_node.text.decode('utf8')
+    func_name = [n.text.decode('utf-8') 
+                 for n in node.children 
+                 if n.type == 'identifier'][0
+                                            ]
+    func_params = [p.text.decode('utf-8') 
+                   for n in node.children 
+                   for p in n.children 
+                   if n.type == 'parameters' and p.type =='identifier'
+                   ]
 
-        return FunctionNode(
-            name=func_name,
-            parameters=parameters.split(",") if parameters else [],
-            return_type="None",
-            body=func_body
-        )
+    return FunctionNode(
+        name=func_name,
+        parameters=func_params,
+        function_calls=function_calls,
+        return_type="None",
+        body=body_text
+    )
 
     return None
 

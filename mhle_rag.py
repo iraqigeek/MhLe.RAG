@@ -298,7 +298,7 @@ async def process_codebase(root_dir):
 
 async def generate_embeddings(text, embedding_model=CODE_EMBEDDING_MODEL):
     headers = {'Content-Type': 'application/json'}
-    embeddings = None; summary = None
+    embeddings = None
     try:
         async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
             embedding_payload = json.dumps({"model": embedding_model, "prompt": text})
@@ -313,9 +313,12 @@ async def generate_embeddings(text, embedding_model=CODE_EMBEDDING_MODEL):
     except Exception as e:
         logging.error(f"Error in generate_embeddings: {str(e)}")
         return None
-    return embeddings, summary
+    return embeddings
 
-async def generate_summaries(text, summary_model=CODE_SUMMERIZATION_MODEL):
+async def generate_summaries(func, node_tree, file_path, summary_model=CODE_SUMMERIZATION_MODEL):
+    funcs = node_tree.functions
+    key = f"function:{func.name}|class:{func.class_name}|path:{file_path}"
+    text = f"{key}: {func.body}"
     headers = {'Content-Type': 'application/json'}
     summary = None
     try:
@@ -461,6 +464,8 @@ async def process_file(file_path, modules, file_trees, file_sizes, package_names
 
 
 def save_embeddings_db(root_dir, embeddings_db):
+    for k, v in embeddings_db.items():
+        v.tolist()
     with open(os.path.join(os.path.abspath(root_dir), CODEBASE_DB_PATH), "w+") as file:
         json.dump({k: v.tolist() for k, v in embeddings_db.items()}, file)
 
@@ -715,35 +720,36 @@ def extract_property_dependencies(node_tree):
 #             embeddings_db[key] = generate_embeddings(f"{key}: {chunk}")
 
 
-async def manage_embeddings(tree_node, file_path, embeddings_db):
+async def manage_embeddings(node_tree, file_path, embeddings_db):
     # Create a list to hold all tasks
     tasks = []
 
-    for class_name in tree_node.class_names:
+    for class_name in node_tree.class_names:
         key = f"class:{class_name}|path:{file_path}"
         task = asyncio.create_task(add_embedding(key, generate_embeddings(f"{key}: {class_name}"), embeddings_db))
         tasks.append(task)
 
-    for import_stmt in tree_node.imports:
+    for import_stmt in node_tree.imports:
         key = f"import:{import_stmt}|path:{file_path}"
         task = asyncio.create_task(add_embedding(key, generate_embeddings(f"{key}: {import_stmt}"), embeddings_db))
         tasks.append(task)
 
-    for export_stmt in tree_node.exports:
+    for export_stmt in node_tree.exports:
         key = f"export:{export_stmt}|path:{file_path}"
         task = asyncio.create_task(add_embedding(key, generate_embeddings(f"{key}: {export_stmt}"), embeddings_db))
         tasks.append(task)
 
-    for prop in tree_node.property_declarations:
+    for prop in node_tree.property_declarations:
         key = f"property:{prop}|path:{file_path}"
         task = asyncio.create_task(add_embedding(key, generate_embeddings(f"{key}: {prop}"), embeddings_db))
         tasks.append(task)
 
-    for func in tree_node.functions:
+    for func in node_tree.functions:
         key = f"function:{func.name}|class:{func.class_name}|path:{file_path}"
         task = asyncio.create_task(add_embedding(key, generate_embeddings(f"{key}: {func.name}"), embeddings_db))
         tasks.append(task)
-        task = asyncio.create_task(add_summary(key, generate_summaries(f"{key}: {func.body}"), func))
+    for func in node_tree.functions:
+        task = asyncio.create_task(add_summary(key, generate_summaries(func, node_tree, file_path), func))
         tasks.append(task)
 
         #body_chunks = chunk_text(func.body)
