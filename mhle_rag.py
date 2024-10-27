@@ -7,22 +7,26 @@ import json
 import argparse
 import pathlib
 #import tiktoken
-import logging
+import logging  
 import networkx as nx
 import numpy as np
 #import requests
 import asyncio
 import httpx
-from scipy.spatial.distance import cosine
+from scipy.spatial.distance import cosine as cos, hamming  as ham
 from tree_sitter import Parser, Language
 
 # custom written ast post-processing utils (there are prob better/cleaner ways of doing this?)
 # the intent is to make retrieving file properties on demand a brainless & quick task.
 # maybe there's a totally big brain way of looking at this in which case pls lmk!
-from grammar_utils.ast_traversers import (
-    TreeNode, traverse_tree_js, traverse_tree_go, traverse_tree_go, traverse_tree_java,
-    traverse_tree_kt, traverse_tree_python, traverse_tree_cpp,traverse_tree_c,
-)
+from grammar_utils.TreeNode_module import TreeNode
+from grammar_utils.parse_c import *
+from grammar_utils.parse_cpp import *
+from grammar_utils.parse_go import *
+from grammar_utils.parse_java import *
+from grammar_utils.parse_js import *
+from grammar_utils.parse_kt import *
+from grammar_utils.parse_py import *
 
 # Ollama backend-- update accordingly.
 EMBEDDING_API_URL = "http://localhost:11434/api/embeddings"
@@ -361,7 +365,7 @@ def query_embeddings(root_dir, query_text, code_embeddings_db, requirements_db, 
     # Query code embeddings
     for key, embedding in code_embeddings_db.items():
         if embedding is not None:
-            similarity = 1 - cosine(query_embedding, embedding)
+            similarity = 1 - cos(query_embedding, embedding)
             file_path = key.split('|path:')[-1]
             snippet = get_snippet(file_trees.get(file_path), key.split('|')[0])
             code_results.append((key, similarity, snippet, "code"))
@@ -371,7 +375,7 @@ def query_embeddings(root_dir, query_text, code_embeddings_db, requirements_db, 
         embedding = np.array(data.get("embedding", []))
         if embedding.size == 0:
             continue
-        similarity = 1 - cosine(query_embedding, embedding)
+        similarity = 1 - cos(query_embedding, embedding)
         requirement_results.append((requirement_id, similarity, data, "requirement"))
 
     code_results.sort(key=lambda x: x[1], reverse=True)
@@ -389,7 +393,7 @@ def layered_query_embeddings(query_text, embeddings_db, file_trees, top_k=5, min
     all_results = []
     for key, embedding in embeddings_db.items():
         if embedding is not None:
-            similarity = 1 - cosine(query_embedding, embedding)
+            similarity = 1 - cos(query_embedding, embedding)
             file_path = key.split('|path:')[-1]
             repo_name = file_path.split(os.sep)[0]
             snippet = get_snippet(file_trees.get(file_path), key.split('|')[0])
@@ -748,9 +752,9 @@ async def manage_embeddings(node_tree, file_path, embeddings_db):
         key = f"function:{func.name}|class:{func.class_name}|path:{file_path}"
         task = asyncio.create_task(add_embedding(key, generate_embeddings(f"{key}: {func.name}"), embeddings_db))
         tasks.append(task)
-    for func in node_tree.functions:
-        task = asyncio.create_task(add_summary(key, generate_summaries(func, node_tree, file_path), func))
-        tasks.append(task)
+    # for func in node_tree.functions:
+    #     task = asyncio.create_task(add_summary(key, generate_summaries(func, node_tree, file_path), func))
+    #     tasks.append(task)
 
         #body_chunks = chunk_text(func.body)
         #for i, chunk in enumerate(body_chunks):
@@ -960,16 +964,27 @@ def load_requirements_db(file_path):
             return json.load(file)
     return {}
 
-def decorator(func):
+def decorator1(func):
     def wrapper():
         print("Something is happening before the function is called.")
         func()
         print("Something is happening after the function is called.")
     return wrapper
 
-@decorator
+def decorator2(func):
+    def wrapper():
+        print("decorator 2.")
+        func()
+    return wrapper
+
+@decorator1
+@decorator2
 def say_whee():
     print("Whee!")
+
+@decorator1
+def say_whaa():
+    print("Whaaa!")
 
 # Main function to process codebase and requirements
 def main():
