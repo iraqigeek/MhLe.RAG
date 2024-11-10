@@ -7,7 +7,7 @@ class TreeNode:
         self.package_import_paths = package_import_paths or {}
         self.package = package or []
         self.imports = imports or []
-        self.import_objects = import_objects or []
+        self.import_objects = import_objects or {}
         self.exports = exports or []
         self.property_declarations = property_declarations or []
         self.functions = functions or []
@@ -18,7 +18,7 @@ class TreeNode:
             "file_path": self.file_path,
             "class_names": self.class_names,
             "imports": self.imports,
-            "import_objects":[imp.to_dict() for imp in self.import_objects],
+            "import_objects":self.import_objects,
             "exports": self.exports,
             "package_import_paths": self.package_import_paths,
             "package": self.package,

@@ -10,8 +10,9 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "args": ["process", "--root_dir", "."]
-            // "args": ["query", "--root_dir", "."]
+            //"args": ["process", "--root_dir", "."]
+            // "args": ["query", "--root_dir", "C://Dev//python//optillm//"]
+            "args": ["process", "--root_dir", "C:\\Dev\\python\\optillm"]
         }
     ]
 }

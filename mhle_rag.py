@@ -11,6 +11,7 @@ import logging
 import networkx as nx
 import numpy as np
 #import requests
+import email.mime as mime
 import asyncio
 import httpx
 from scipy.spatial.distance import cosine as cos, hamming  as ham
@@ -183,7 +184,7 @@ def chunk_text(text, tokens_per_chunk=500):
     words = text.split()
     return [' '.join(words[i:i+tokens_per_chunk]) for i in range(0, len(words), tokens_per_chunk)]
 
-def process_code_string(code_string, language, file_path):
+def process_code_string(code_string, language, file_path, root_dir):
     parser = Parser()
     parser.set_language(language)
     tree = parser.parse(bytes(code_string, "utf8"))
@@ -200,7 +201,7 @@ def process_code_string(code_string, language, file_path):
     elif language.name == "go":
         traverse_tree_go(root_node, bytes(code_string, "utf8"), node_tree, language)
     elif language.name == "python":
-        traverse_tree_python(root_node, bytes(code_string, "utf8"), node_tree, language, parser)
+        traverse_tree_python(root_node, code_string, node_tree, language, parser, root_dir)
     elif language.name == "cpp":
         traverse_tree_cpp(root_node, bytes(code_string, "utf8"), node_tree, language)
     elif language.name == "c":
@@ -220,7 +221,7 @@ def load_file_trees(file_path):
 
 def should_skip_path(path):
     skip_directories = [
-        '.venv','node_modules', 'build', 'dist', 'out', 'bin', '.git', '.svn', '.vscode',
+        '.venv','node_modules', 'build', 'dist', 'out', 'bin', '.git', '.svn', '.vscode', '.aider'
         '__pycache__', '.idea', 'obj', 'lib', 'vendor', 'target', '.next', 'pkg',
         'venv', '.tox', 'wheels', 'Debug', 'Release', 'deps', 'rag_assets'
     ]
@@ -267,17 +268,14 @@ async def process_codebase(root_dir):
     total_directories = len(directories)
     processed_directories = 0
     readme_info_list = []
-    global embeddings_db
     embeddings_db = {}
 
     tasks = []
-    for dir_name in root_dir:
-        repo_path = os.path.join(root_dir, dir_name)
-        if os.path.isdir(repo_path):
-            module_dir = dir_name
+    for dir_name in directories:
+        if os.path.isdir(dir_name):
             processed_directories += 1
             logging.info(f"Processing {dir_name}: {(processed_directories / total_directories) * 100:.2f}% complete")
-            task = asyncio.create_task(process_repository(repo_path, modules, file_trees, file_sizes, package_names, readme_info_list))
+            task = asyncio.create_task(process_repository(dir_name, root_dir, modules, file_trees, file_sizes, package_names, readme_info_list))
             tasks.append(task)
 
 
@@ -304,7 +302,7 @@ async def generate_embeddings(text, embedding_model=CODE_EMBEDDING_MODEL):
     headers = {'Content-Type': 'application/json'}
     embeddings = None
     try:
-        async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
+        async with httpx.AsyncClient(verify=False, timeout=180.0) as client:
             embedding_payload = json.dumps({"model": embedding_model, "prompt": text})
             response = await client.post(EMBEDDING_API_URL, data=embedding_payload, headers=headers)
             response.raise_for_status()
@@ -420,7 +418,7 @@ def layered_query_embeddings(query_text, embeddings_db, file_trees, top_k=5, min
 
 
 
-async def process_repository(repo_path, modules, file_trees, file_sizes, package_names, readme_info_list):
+async def process_repository(repo_path, root_dir, modules, file_trees, file_sizes, package_names, readme_info_list):
     for root, dirs, files in os.walk(repo_path):
         if should_skip_path(root):
             continue
@@ -431,10 +429,10 @@ async def process_repository(repo_path, modules, file_trees, file_sizes, package
         for file in files:
             file_path = os.path.join(root, file)
             logging.debug(f"processing file: {file_path}")
-            await process_file(file_path, modules, file_trees, file_sizes, package_names, readme_info_list)
+            await process_file(file_path, root_dir, modules, file_trees, file_sizes, package_names, readme_info_list)
 
 
-async def process_file(file_path, modules, file_trees, file_sizes, package_names, readme_info_list):
+async def process_file(file_path, root_dir, modules, file_trees, file_sizes, package_names, readme_info_list):
     _, file_extension = os.path.splitext(file_path)
 
     for lang, (language_obj, extensions) in extension_to_language.items():
@@ -445,12 +443,12 @@ async def process_file(file_path, modules, file_trees, file_sizes, package_names
                 with open(file_path, "r", encoding="utf-8") as f:
                     file_content = f.read()
 
-                node_tree = process_code_string(file_content, language_obj, file_path)
+                node_tree = process_code_string(file_content, language_obj, file_path, root_dir)
                 file_trees[file_path] = node_tree
                 package_names[file_path] = "/".join(os.path.relpath(file_path, start=os.path.dirname(file_path)).split(os.sep)[:-1])
                 file_sizes[file_path] = len(file_content.encode("utf-8")).__float__()
 
-                await manage_embeddings(node_tree, file_path, embeddings_db)
+                #await manage_embeddings(node_tree, file_path, embeddings_db)
 
                 repo_name = os.path.basename(os.path.dirname(file_path))
                 if repo_name not in modules:
